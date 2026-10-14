@@ -1,0 +1,4 @@
+# DNS lookups.
+dnspython>=2.8.0,<3
+# DKIM verification with Ed25519 support.
+dkimpy[ed25519]==1.1.8

@@ -1,0 +1,12 @@
+{
+  "messages": 40818,
+  "senders": 800,
+  "rendered_counter_values": 70,
+  "heartbeat_callbacks": 176,
+  "max_heartbeat_gap_seconds": 0.265,
+  "elapsed_seconds": 17.31,
+  "progress": "Complete | 40,818 / 40,818 messages (100%)",
+  "status": "Complete. Checked 40,818/40,818 messages; 800 unique unsubscribe entries; 0 unreadable/missing. No requests sent. Elapsed 00:17.",
+  "requests_sent": 0,
+  "test_type": "In-memory inbox; real Tk window and worker; no network"
+}
