@@ -33,7 +33,7 @@ class RuntimePathTests(unittest.TestCase):
                 patch.dict(os.environ, {"LOCALAPPDATA": str(Path(home) / "AppData" / "Local")}):
             directory = launcher.runtime_directory()
             self.assertEqual(directory.parent, Path(home) / ".gmail-unsubscriber")
-            self.assertNotIn("AppData", directory.parts)
+            self.assertNotEqual(directory.parent, Path(os.environ["LOCALAPPDATA"]) / ".gmail-unsubscriber")
             self.assertFalse(directory.exists())
 
     def test_unix_retains_xdg_data_home(self):

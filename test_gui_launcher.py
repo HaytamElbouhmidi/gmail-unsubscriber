@@ -266,7 +266,14 @@ class AppChoiceTests(OfflineCase):
                 with patch.object(app, "scan_and_unsubscribe") as scan:
                     guard, emit = app.NetworkGuard(), MagicMock()
                     target(*args, guard=guard, emit=emit)
-                scan.assert_called_once_with(ACCOUNT, PASSWORD, limit, guard, self.gui.ledger, emit, automatic=automatic)
+                scan.assert_called_once()
+                self.assertEqual(scan.call_args.args,
+                                 (ACCOUNT, PASSWORD, limit, guard, self.gui.ledger, emit))
+                self.assertEqual(scan.call_args.kwargs["automatic"], automatic)
+                self.assertFalse(scan.call_args.kwargs["include_spam"])
+                self.assertFalse(scan.call_args.kwargs["request_fallback"])
+                self.assertTrue(scan.call_args.kwargs["resume"])
+                self.assertIsNotNone(scan.call_args.kwargs["history"])
 
     def test_change_amount_updates_inline_setting(self):
         self.gui.scan_choice_var.set("Custom")

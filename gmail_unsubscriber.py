@@ -24,7 +24,7 @@ import time
 import tkinter as tk
 import webbrowser
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email import policy
@@ -36,6 +36,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any, Callable, Iterator
 from urllib.parse import unquote, urlsplit, urlunsplit
+from scan_history import HistoryStore
 
 IMAP_HOST = "imap.gmail.com"
 SMTP_HOST = "smtp.gmail.com"
@@ -52,7 +53,8 @@ MAX_URI = 8192
 MAX_BODY = 64 * 1024
 POST_VALUE = "List-Unsubscribe=One-Click"
 POST_BODY = POST_VALUE.encode("ascii")
-HEADER_FIELDS = "FROM SUBJECT DATE LIST-ID LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DKIM-SIGNATURE"
+APP_VERSION = "3.1.0"
+HEADER_FIELDS = "FROM SUBJECT DATE LIST-ID PRECEDENCE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DKIM-SIGNATURE"
 # Use a plain header fetch. The IMAP reader enforces the size limit.
 FETCH_HEADERS = f"(BODY.PEEK[HEADER.FIELDS ({HEADER_FIELDS})])"
 FETCH_HEADER_ALTERNATIVES = (FETCH_HEADERS, "(BODY.PEEK[HEADER])", "(RFC822.HEADER)")
@@ -641,8 +643,31 @@ def uidvalidity(mail: Any) -> str:
 
 
 
+def spam_mailbox_name(mail: Any, guard: NetworkGuard) -> str:
+    """Prefer the Gmail IMAP mailbox flagged as Junk to a localized name."""
+    # gmail_inbox already owns the bounded network operation.
+    guard.check()
+    status, data = mail.list()
+    require_ok(status, "Discover Spam folder", data)
+    for item in data or ():
+        if not isinstance(item, bytes):
+            continue
+        match = re.match(rb"\(([^)]*)\)\s+\S+\s+(.+)$", item)
+        if not match or b"\\junk" not in match.group(1).lower():
+            continue
+        raw = match.group(2).strip()
+        if raw.startswith(b'"') and raw.endswith(b'"'):
+            raw = raw[1:-1].replace(b'\\"', b'"').replace(b'\\\\', b'\\')
+        try:
+            return raw.decode("ascii")
+        except UnicodeError:
+            break
+    return "[Gmail]/Spam"
+
+
 @contextmanager
-def gmail_inbox(account: str, password: str, guard: NetworkGuard) -> Iterator[tuple[Any, str]]:
+def gmail_inbox(account: str, password: str, guard: NetworkGuard,
+                *, folder: str = "INBOX") -> Iterator[tuple[Any, str]]:
     mail = None
     try:
         with guard.operation():
@@ -655,8 +680,9 @@ def gmail_inbox(account: str, password: str, guard: NetworkGuard) -> Iterator[tu
                 raise  # A dropped connection doesn't mean the password was rejected.
             except imaplib.IMAP4.error as exc:
                 raise AuthenticationError("Gmail authentication failed. Check your address and app password.") from exc
-            status, data = mail.select("INBOX", readonly=True)
-            require_ok(status, "Read-only INBOX selection", data)
+            mailbox = "INBOX" if folder == "INBOX" else spam_mailbox_name(mail, guard)
+            status, data = mail.select(mailbox, readonly=True)
+            require_ok(status, f"Read-only {folder} selection", data)
             validity = uidvalidity(mail)
         yield mail, validity
     finally:
@@ -733,6 +759,7 @@ class Candidate:
     targets: tuple[Target, ...]
     header_fingerprint: str
     sent_at: datetime | None = None
+    folder: str = "INBOX"
 
     @property
     def key(self) -> str:
@@ -745,10 +772,36 @@ def header_values(message: Any, name: str) -> list[str]:
     return [re.sub(r"\r?\n[ \t]+", " ", str(v)).strip() for v in message.get_all(name, [])]
 
 
-def parse_candidate(raw: bytes, uid: str, validity: str) -> Candidate | None:
+def request_email_target(message: Any, sender: str) -> Target | None:
+    """Use a plain request only for identifiable mailing-list mail."""
+    from urllib.parse import quote
+    if len(message.get_all("From", [])) != 1:
+        return None
+    list_id = header_values(message, "List-ID")
+    precedence = header_values(message, "Precedence")
+    list_unsubscribe = header_values(message, "List-Unsubscribe")
+    if not ((len(list_id) == 1 and list_id[0]) or
+            (len(precedence) == 1 and precedence[0].casefold() in {"list", "bulk"}) or
+            (len(list_unsubscribe) == 1 and bool(list_unsubscribe[0]))):
+        return None
+    try:
+        address = validate_address(sender)
+    except (ValueError, SafetyError):
+        return None
+    mailbox_name = address.split("@", 1)[0].casefold().replace(".", "").replace("-", "").replace("_", "")
+    if any(word in mailbox_name for word in ("noreply", "donotreply", "bounce", "mailerdaemon", "postmaster")):
+        return None
+    subject = quote("Unsubscribe request", safe="")
+    body = quote("Please remove me from this mailing list and stop sending these messages. Thank you.", safe="")
+    return Target("REQUEST", f"mailto:{quote(address, safe='@')}?subject={subject}&body={body}",
+                  "Plain unsubscribe request to the list sender. Removal is not independently confirmed.")
+
+
+def parse_candidate(raw: bytes, uid: str, validity: str, *, folder: str = "INBOX",
+                    request_fallback: bool = False) -> Candidate | None:
     message = BytesHeaderParser(policy=policy.compat32).parsebytes(raw)
     unsubscribe = header_values(message, "List-Unsubscribe")
-    if not unsubscribe:
+    if not unsubscribe and not request_fallback:
         return None
     post = header_values(message, "List-Unsubscribe-Post")
     links = list(dict.fromkeys(re.findall(r"<([^<>]+)>", " ".join(unsubscribe))))
@@ -756,37 +809,44 @@ def parse_candidate(raw: bytes, uid: str, validity: str) -> Candidate | None:
     name = display_text(name or address or "Unknown sender")
     address = display_text(address)
     list_id = display_text(message.get("List-ID", ""))
-    malformed_headers = (len(unsubscribe) != 1 or len(post) > 1 or len(links) > 16
-                         or len(message.get_all("From", [])) != 1)
+    malformed_headers = (len(unsubscribe) > 1 or len(post) > 1 or len(links) > 16 or
+                         len(message.get_all("From", [])) != 1)
     web_schemes = [link.split(":", 1)[0].lower() for link in links if ":" in link]
-    one_click = (not malformed_headers and post == [POST_VALUE]
-                 and web_schemes.count("https") == 1 and "http" not in web_schemes)
-    targets = []
-    if not links:
+    one_click = (not malformed_headers and post == [POST_VALUE] and
+                 web_schemes.count("https") == 1 and "http" not in web_schemes)
+    targets: list[Target] = []
+    if unsubscribe and not links:
         targets.append(Target("BLOCKED", "", "No supported angle-bracketed unsubscribe target."))
     for link in links[:16]:
         try:
             if malformed_headers:
-                raise SafetyError("Missing/duplicate From, duplicate unsubscribe headers, or too many targets; manual inspection required.")
+                raise SafetyError("Duplicate From or unsubscribe headers, or too many targets. Manual inspection required.")
             scheme = link.split(":", 1)[0].lower()
             if scheme in {"https", "http"}:
                 parsed = parse_web_url(link, https_only=False)
                 if one_click and scheme == "https":
                     targets.append(Target("POST", parsed.url, "DKIM verification required before sending."))
                 else:
-                    targets.append(Target("MANUAL", parsed.url, "No verified one-click action; review the website manually."))
+                    targets.append(Target("MANUAL", parsed.url, "Review this webpage manually."))
             elif scheme == "mailto":
                 parse_mailto(link)
-                targets.append(Target("MAILTO", link, "Sends an email; no DKIM authentication is required for this fallback."))
+                targets.append(Target("MAILTO", link, "Sends an email to the listed unsubscribe address."))
             else:
                 raise SafetyError("Unsupported unsubscribe scheme.")
         except (ValueError, UnicodeError) as exc:
             targets.append(Target("BLOCKED", link, display_text(exc)))
-    targets.sort(key=lambda target: {"POST": 0, "MAILTO": 1, "MANUAL": 2, "BLOCKED": 3}[target.method])
-    # Check that the full message still has the same unsubscribe headers.
+    if request_fallback and folder == "INBOX" and not malformed_headers and not any(
+            target.method in {"MAILTO", "BLOCKED"} for target in targets):
+        plain_request = request_email_target(message, address)
+        if plain_request is not None:
+            targets.append(plain_request)
+    if not targets:
+        return None
+    targets.sort(key=lambda target: {"POST": 0, "MAILTO": 1, "MANUAL": 2,
+                                     "BLOCKED": 3, "REQUEST": 4}[target.method])
     fingerprint = hashlib.sha256(repr((unsubscribe, post)).encode("utf-8")).hexdigest()
     return Candidate(uid, validity, name, address, decode_mime_header(message.get("Subject")),
-                     list_id, tuple(targets), fingerprint, parse_sent_date(message))
+                     list_id, tuple(targets), fingerprint, parse_sent_date(message), folder)
 
 
 def scan_mailbox(account: str, password: str, limit: int, guard: NetworkGuard,
@@ -901,7 +961,7 @@ def submit_one_click(url: str, guard: NetworkGuard) -> tuple[str, str]:
             connection.request("POST", target.path, body=POST_BODY, headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Content-Length": str(len(POST_BODY)),
-                "User-Agent": "Gmail-Auto-Unsubscriber/3.0",
+                "User-Agent": f"Gmail-Auto-Unsubscriber/{APP_VERSION}",
                 "Connection": "close",
             })
             response = connection.getresponse()
@@ -979,7 +1039,9 @@ def send_mailto(uri: str, account: str, password: str, guard: NetworkGuard) -> t
 
 def execute_candidate(candidate: Candidate, account: str, password: str, guard: NetworkGuard,
                       fetch_raw: Callable[[Candidate], bytes], attempted: set[tuple[str, str]],
-                      ledger: dict[tuple[str, str, str], str], emit: Callable[[str, Any], None]) -> None:
+                      ledger: dict[tuple[str, str, str], str], emit: Callable[[str, Any], None],
+                      *, before_send: Callable[[Candidate, Target], None] | None = None,
+                      after_send: Callable[[Candidate, Target, str], None] | None = None) -> None:
     def record(target: Target, status: str, detail: str) -> None:
         emit("result", Result(candidate, account, target.method, target.uri, status, detail))
 
@@ -1029,8 +1091,13 @@ def execute_candidate(candidate: Candidate, account: str, password: str, guard: 
                 continue  # A valid mailto alternative can still be used.
             emit("log", f"{candidate.sender_name}: {detail}")
         guard.check()
+        if before_send is not None:
+            before_send(candidate, target)
         attempted.add(target_key)
-        emit("activity", f"Sending {'one-click request' if target.method == 'POST' else 'unsubscribe email'} for {candidate.sender_name}...")
+        method_label = ("one-click request" if target.method == "POST" else
+                        "unsubscribe email" if target.method == "MAILTO" else
+                        "unsubscribe request email")
+        emit("activity", f"Sending {method_label} for {candidate.sender_name}...")
         try:
             status, detail = (submit_one_click(target.uri, guard) if target.method == "POST"
                               else send_mailto(target.uri, account, password, guard))
@@ -1038,10 +1105,13 @@ def execute_candidate(candidate: Candidate, account: str, password: str, guard: 
             raise
         except (SafetyError, ValueError) as exc:
             status, detail = "Blocked", display_text(exc)
-        record(target, status, detail)
         if status in SUCCESS_STATUSES | UNCERTAIN_STATUSES:
             ledger[ledger_key] = status
             ledger[entry_key] = status
+        if after_send is not None:
+            after_send(candidate, target, status)
+        record(target, status, detail)
+        if status in SUCCESS_STATUSES | UNCERTAIN_STATUSES:
             # Use an event wait so Stop works during the delay.
             emit("activity", "Pausing before the next unsubscribe request...")
             guard.stop_event.wait(SEND_INTERVAL)
@@ -1053,17 +1123,28 @@ def execute_candidate(candidate: Candidate, account: str, password: str, guard: 
 
 def process_selected(candidates: tuple[Candidate, ...], account: str, password: str,
                      guard: NetworkGuard, ledger: dict[tuple[str, str, str], str],
-                     emit: Callable[[str, Any], None]) -> None:
-    """Send requests only for the checked entries captured at the start."""
+                     emit: Callable[[str, Any], None], *, history: Any = None,
+                     run_id: int | None = None) -> None:
+    """Process checked senders with mailbox-specific verification and durable outcomes."""
     attempted: set[tuple[str, str]] = set()
     seen: set[str] = set()
     completed_lists: set[str] = set()
-    with RecoveringInbox(account, password, guard, emit) as inbox:
+    if history is not None:
+        ledger.update(history.load_ledger(account))
+    with ExitStack() as stack:
+        boxes = {}
+        for candidate in candidates:
+            if candidate.folder not in boxes:
+                boxes[candidate.folder] = stack.enter_context(
+                    RecoveringInbox(account, password, guard, emit, folder=candidate.folder))
+
         def load(candidate: Candidate) -> bytes:
-            inbox._open()
-            if any(item.validity != inbox.validity for item in candidates):
-                raise StaleScanError("INBOX UIDVALIDITY changed. Run a new scan before sending.")
-            return inbox.verification_message(candidate)
+            box = boxes[candidate.folder]
+            box._open()
+            if any(item.validity != boxes[item.folder].validity for item in candidates
+                   if boxes[item.folder].mail is not None):
+                raise StaleScanError("A mailbox UIDVALIDITY changed. Run a fresh scan before sending.")
+            return box.verification_message(candidate)
 
         completed = 0
         emit("progress", ProgressUpdate(0, len(candidates), "Preparing checked senders...", "entries"))
@@ -1080,7 +1161,7 @@ def process_selected(candidates: tuple[Candidate, ...], account: str, password: 
                         completed_lists.add(list_key)
                         emit("result", Result(candidate, account, "ENTRY", "",
                              "Outcome unknown" if previous in UNCERTAIN_STATUSES else "Already submitted",
-                             "This mailing list was already processed during this app session; no request repeated."))
+                             "This list has already been processed. No request repeated."))
                     completed = index
                     continue
                 outcomes: list[Result] = []
@@ -1091,16 +1172,28 @@ def process_selected(candidates: tuple[Candidate, ...], account: str, password: 
                         if ledger_key and payload.status in SUCCESS_STATUSES | UNCERTAIN_STATUSES:
                             ledger[ledger_key] = payload.status
                             completed_lists.add(list_key)
+                        if history is not None:
+                            history.record_result(account, run_id, payload)
                     emit(kind, payload)
 
-                execute_candidate(candidate, account, password, guard, load, attempted, ledger, report)
-                states = {r.status for r in outcomes}
+                def reserve(c: Candidate, target: Target) -> None:
+                    if history is not None:
+                        history.reserve(account, c, target, ledger)
+
+                def finalize(c: Candidate, target: Target, status: str) -> None:
+                    if history is not None:
+                        history.finalize(account, c, target, status, ledger)
+
+                execute_candidate(candidate, account, password, guard, load, attempted, ledger,
+                                  report, before_send=reserve, after_send=finalize)
+                states = {result.status for result in outcomes}
                 unverified_post = any(r.method == "POST" and r.status == "Manual action required" for r in outcomes)
                 if not unverified_post or states & (SUCCESS_STATUSES | UNCERTAIN_STATUSES):
                     seen.add(candidate.key)
                 completed = index
             finally:
-                emit("progress", ProgressUpdate(completed, len(candidates), "Updating checked-sender results...", "entries"))
+                emit("progress", ProgressUpdate(completed, len(candidates),
+                     "Updating checked-sender results...", "entries"))
     emit("log", "Checked senders processed. Accepted requests are not proof of completed removal.")
 
 
@@ -1111,8 +1204,9 @@ class RecoveringInbox:
     an HTTP or SMTP timeout can happen after a request was sent.
     """
     def __init__(self, account: str, password: str, guard: NetworkGuard,
-                 emit: Callable[[str, Any], None]) -> None:
+                 emit: Callable[[str, Any], None], folder: str = "INBOX") -> None:
         self.account, self.password, self.guard, self.emit = account, password, guard, emit
+        self.folder = folder
         self.mail: Any = None
         self.context: Any = None
         self.validity: str | None = None
@@ -1132,11 +1226,12 @@ class RecoveringInbox:
     def _open(self) -> None:
         if self.mail is not None:
             return
-        context = gmail_inbox(self.account, self.password, self.guard)
+        context = (gmail_inbox(self.account, self.password, self.guard) if self.folder == "INBOX"
+                   else gmail_inbox(self.account, self.password, self.guard, folder=self.folder))
         mail, validity = context.__enter__()
         if self.validity is not None and validity != self.validity:
             context.__exit__(None, None, None)
-            raise StaleScanError("INBOX UIDVALIDITY changed after reconnecting. Stopped to avoid processing the wrong messages.")
+            raise StaleScanError(f"{self.folder} UIDVALIDITY changed. Start a fresh scan to avoid mismatched UIDs.")
         self.mail, self.context, self.validity = mail, context, validity
 
     def read(self, description: str, action: Callable[[Any], Any]) -> Any:
@@ -1187,7 +1282,7 @@ class RecoveringInbox:
             # Sort UIDs numerically, newest first, then take the requested count.
             result = sorted({int(uid) for uid in values}, reverse=True)
             return [str(uid) for uid in (result[:limit] if limit else result)]
-        return self.read("List INBOX messages", search)
+        return self.read(f"List {self.folder} messages", search)
 
     def headers(self, uid: str) -> bytes | None:
         queries = tuple(dict.fromkeys((self.header_query, *FETCH_HEADER_ALTERNATIVES)))
@@ -1206,7 +1301,7 @@ class RecoveringInbox:
 
     def verification_message(self, candidate: Candidate) -> bytes:
         if candidate.validity != self.validity:
-            raise StaleScanError("Candidate does not belong to the current INBOX generation.")
+            raise StaleScanError(f"Candidate does not belong to the current {self.folder} generation.")
         return self.read(f"UID {candidate.uid} full-message verification fetch",
                          lambda mail: fetch_for_verification(mail, candidate, self.guard))
 
@@ -1237,121 +1332,211 @@ def run_summary(stats: dict[str, int]) -> str:
 
 def scan_and_unsubscribe(account: str, password: str, limit: int, guard: NetworkGuard,
                          ledger: dict[tuple[str, str, str], str],
-                         emit: Callable[[str, Any], None], *, automatic: bool = True) -> None:
-    """Scan newest first and optionally unsubscribe as each list is found.
-
-    The mode is fixed when the scan starts. Scan-only mode reads headers;
-    it doesn't fetch full messages or contact unsubscribe endpoints.
-    """
+                         emit: Callable[[str, Any], None], *, automatic: bool = True,
+                         include_spam: bool = False, request_fallback: bool = False,
+                         history: Any = None, resume: bool = False) -> None:
+    """Read requested folders and checkpoint each processed UID before moving on."""
     if not isinstance(limit, int) or limit < 0:
-        raise ValueError("The message limit must be a nonnegative integer; zero means all INBOX.")
+        raise ValueError("The message limit must be a nonnegative integer. Zero means all messages.")
     seen: set[str] = set()
     attempted: set[tuple[str, str]] = set()
     consecutive_failures = 0
     stats = dict(total=0, checked=0, accepted=0, unknown=0, manual=0,
                  failed=0, duplicates=0, unreadable=0, found=0, automatic=int(automatic))
-    emit("progress", ProgressUpdate(0, None, "Connecting to Gmail and listing INBOX messages..."))
+    settings = dict(limit=limit, automatic=automatic, include_spam=include_spam,
+                    request_fallback=request_fallback)
+    folders = ("INBOX", "SPAM") if include_spam else ("INBOX",)
+    emit("progress", ProgressUpdate(0, None, "Connecting to Gmail and loading message lists..."))
+    run_id = None
+    completed_run = False
     try:
-        with RecoveringInbox(account, password, guard, emit) as inbox:
-            ids = inbox.message_ids(limit)
-            stats['total'] = len(ids)
-            emit("progress", ProgressUpdate(0, len(ids), "Message list loaded. Starting scan..."))
-            if automatic:
-                emit("log", f"Scanning and automatically unsubscribing from {len(ids):,} newest INBOX messages. "
-                     "Requests are sent as supported lists are found.")
-            else:
-                emit("log", f"Scanning {len(ids):,} newest INBOX messages. No unsubscribe requests will be sent.")
-            emit("log", "Mailbox access is read-only. Existing messages are not deleted or marked as read. "
-                 "Ordinary confirmation webpages require manual action.")
-            for index, uid in enumerate(ids, 1):
-                guard.check()
-                emit("progress", ProgressUpdate(stats['checked'], len(ids),
-                     f"Reading message {index:,}/{len(ids):,} (UID {uid})..."))
-                try:
-                    try:
-                        raw = inbox.headers(uid)
-                    except (MessageFetchError, OversizedLiteral) as exc:
-                        stats['checked'] = index
-                        stats['unreadable'] += 1
-                        consecutive_failures += 1
-                        emit("log", f"SKIPPED message UID {uid}: {display_text(exc)}")
-                        if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
-                            raise MailboxError(
-                                f"{consecutive_failures} consecutive messages could not be read. "
-                                "Stopped instead of silently skipping the rest of the inbox. "
-                                "Earlier request outcomes are preserved in Results and export.") from exc
-                        continue
-                    stats['checked'] = index
-                    consecutive_failures = 0
-                    if raw is None:
-                        stats['unreadable'] += 1
-                        emit("log", f"UID {uid} is no longer in INBOX; skipped.")
-                        continue
-                    try:
-                        emit("message", parse_message_info(raw, uid))
-                        candidate = parse_candidate(raw, uid, str(inbox.validity))
-                    except (ValueError, UnicodeError) as exc:
-                        stats['unreadable'] += 1
-                        emit("log", f"UID {uid}: malformed headers; skipped. {display_text(exc)}")
-                        continue
-                    if candidate is None:
-                        continue
-                    if not automatic:
-                        # Keep older subjects for search and alternate copies for DKIM checks.
+        if history is not None:
+            ledger.update(history.load_ledger(account))
+        restored = history.latest_incomplete(account, settings) if history is not None and resume else None
+        with ExitStack() as stack:
+            boxes = {folder: stack.enter_context(RecoveringInbox(account, password, guard, emit, folder=folder))
+                     for folder in folders}
+            if restored:
+                run_id, snapshot, stats = restored
+                emit("run_id", run_id)
+                for item in snapshot:
+                    boxes[item["folder"]].validity = str(item["validity"])
+                records = history.checkpoints(run_id)
+                seen = history.seen_keys(run_id)
+                prior_outcomes = history.outcomes(run_id)
+                attempted = {(result.method, result.target) for result in prior_outcomes
+                             if result.method in {"POST", "MAILTO", "REQUEST"} and result.status == "Failed"}
+                emit("log", f"Resuming saved scan. {len(records):,} messages already checked.")
+                for (folder, uid), (info, candidate, unreadable) in records.items():
+                    guard.check()
+                    if info is not None:
+                        emit("message", info)
+                    if candidate is not None:
                         emit("candidate", candidate)
-                        if candidate.key in seen:
-                            stats['duplicates'] += 1
-                        else:
-                            seen.add(candidate.key)
-                            stats['found'] += 1
+                        entry = ledger.get((account.casefold(), "ENTRY", candidate.key))
+                        if entry in UNCERTAIN_STATUSES and not any(
+                            r.candidate.key == candidate.key for r in prior_outcomes):
+                            emit("entry_status", (candidate, "Outcome unknown"))
+                for result in prior_outcomes:
+                    guard.check()
+                    emit("result", result)
+            else:
+                all_ids = {folder: boxes[folder].message_ids(0 if include_spam else limit)
+                           for folder in folders}
+                if include_spam and limit:
+                    inbox_ids = all_ids["INBOX"]
+                    spam_ids = all_ids["SPAM"]
+                    inbox_count = min(len(inbox_ids), (limit + 1) // 2)
+                    spam_count = min(len(spam_ids), limit // 2)
+                    remaining = limit - inbox_count - spam_count
+                    if remaining:
+                        take = min(remaining, len(inbox_ids) - inbox_count)
+                        inbox_count += take
+                        remaining -= take
+                    if remaining:
+                        spam_count += min(remaining, len(spam_ids) - spam_count)
+                    all_ids["INBOX"] = inbox_ids[:inbox_count]
+                    all_ids["SPAM"] = spam_ids[:spam_count]
+                snapshot = [{"folder": folder, "validity": str(boxes[folder].validity),
+                             "uids": all_ids[folder]} for folder in folders]
+                stats["total"] = sum(len(item["uids"]) for item in snapshot)
+                records = {}
+                if history is not None:
+                    run_id = history.new_run(account, settings, snapshot, stats)
+                    emit("run_id", run_id)
+            total = sum(len(item["uids"]) for item in snapshot)
+            stats["total"] = total
+            emit("progress", ProgressUpdate(stats["checked"], total, "Message list loaded. Starting scan..."))
+            names = "INBOX + Spam" if include_spam else "INBOX"
+            mode = "Auto unsubscribe enabled" if automatic else "Scan only"
+            emit("log", f"{mode}. {total:,} messages from {names}. No messages will be moved or marked as read.")
+            if include_spam and automatic:
+                emit("log", "Spam is scanned for review only. No automatic requests are sent to Spam senders.")
+            if request_fallback:
+                emit("log", "Sender-directed email fallback enabled for identifiable mailing lists in INBOX only.")
+            for item in snapshot:
+                folder = item["folder"]
+                inbox = boxes[folder]
+                ids = item["uids"]
+                for uid in ids:
+                    if (folder, uid) in records:
                         continue
-                    list_key = subscription_key(candidate)
-                    list_ledger_key = (account.casefold(), "LIST", list_key) if list_key else None
-                    prior_list = ledger.get(list_ledger_key) if list_ledger_key else None
-                    emit("candidate", candidate)
-                    if candidate.key in seen or prior_list in SUCCESS_STATUSES | UNCERTAIN_STATUSES:
-                        stats['duplicates'] += 1
-                        if prior_list:
-                            emit("entry_status", (candidate, "Outcome unknown" if prior_list in UNCERTAIN_STATUSES else "Already submitted"))
-                        continue
-                    stats['found'] += 1
-                    emit("log", f"UID {uid}: processing {candidate.sender_name} <{candidate.sender_email}>.")
-                    outcomes: list[Result] = []
-
-                    def report(kind: str, payload: Any) -> None:
-                        if kind == "result":
-                            outcomes.append(payload)
-                            if list_ledger_key and payload.status in SUCCESS_STATUSES | UNCERTAIN_STATUSES:
-                                # Save the outcome now. Stop may prevent another loop iteration.
-                                ledger[list_ledger_key] = payload.status
-                        emit(kind, payload)
-
+                    guard.check()
+                    info = None
+                    candidate = None
+                    unreadable = False
+                    emit("progress", ProgressUpdate(stats["checked"], total,
+                         f"Reading message {stats['checked'] + 1:,}/{total:,} ({folder} UID {uid})..."))
+                    checkpoint_ok = True
+                    terminal_read_failure = False
                     try:
-                        execute_candidate(candidate, account, password, guard, inbox.verification_message,
-                                          attempted, ledger, report)
+                        try:
+                            raw = inbox.headers(uid)
+                        except (MessageFetchError, OversizedLiteral) as exc:
+                            unreadable = True
+                            stats["unreadable"] += 1
+                            consecutive_failures += 1
+                            emit("log", f"SKIPPED {folder} UID {uid}: {display_text(exc)}")
+                            if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
+                                # This UID was inspected and found unreadable. Save the
+                                # fifth failure before ending the run for reconnect review.
+                                terminal_read_failure = True
+                                raise MailboxError(
+                                    f"{consecutive_failures} consecutive messages could not be read. "
+                                    "The saved checkpoint can be resumed later.") from exc
+                            continue
+                        consecutive_failures = 0
+                        if raw is None:
+                            unreadable = True
+                            stats["unreadable"] += 1
+                            emit("log", f"{folder} UID {uid} no longer exists. Skipped.")
+                            continue
+                        try:
+                            info = parse_message_info(raw, uid, folder=folder)
+                            emit("message", info)
+                            candidate = parse_candidate(raw, uid, str(inbox.validity), folder=folder,
+                                                        request_fallback=request_fallback and folder == "INBOX")
+                        except (ValueError, UnicodeError) as exc:
+                            unreadable = True
+                            stats["unreadable"] += 1
+                            emit("log", f"{folder} UID {uid}: invalid message headers. {display_text(exc)}")
+                            continue
+                        if candidate is None:
+                            continue
+                        emit("candidate", candidate)
+                        if not automatic or folder == "SPAM":
+                            if candidate.key in seen:
+                                stats["duplicates"] += 1
+                            else:
+                                seen.add(candidate.key)
+                                stats["found"] += 1
+                            continue
+                        list_key = subscription_key(candidate)
+                        list_ledger_key = (account.casefold(), "LIST", list_key) if list_key else None
+                        previous = ledger.get(list_ledger_key) if list_ledger_key else None
+                        if candidate.key in seen or previous in SUCCESS_STATUSES | UNCERTAIN_STATUSES:
+                            stats["duplicates"] += 1
+                            if previous:
+                                emit("entry_status", (candidate, "Outcome unknown" if previous in UNCERTAIN_STATUSES
+                                                      else "Already submitted"))
+                            continue
+                        stats["found"] += 1
+                        outcomes: list[Result] = []
+
+                        def report(kind: str, payload: Any) -> None:
+                            if kind == "result":
+                                outcomes.append(payload)
+                                if list_ledger_key and payload.status in SUCCESS_STATUSES | UNCERTAIN_STATUSES:
+                                    ledger[list_ledger_key] = payload.status
+                                if history is not None:
+                                    history.record_result(account, run_id, payload)
+                            emit(kind, payload)
+
+                        def reserve(c: Candidate, target: Target) -> None:
+                            if history is not None:
+                                history.reserve(account, c, target, ledger)
+
+                        def finalize(c: Candidate, target: Target, status: str) -> None:
+                            if history is not None:
+                                history.finalize(account, c, target, status, ledger)
+
+                        try:
+                            execute_candidate(candidate, account, password, guard, inbox.verification_message,
+                                              attempted, ledger, report, before_send=reserve, after_send=finalize)
+                        finally:
+                            states = {result.status for result in outcomes}
+                            unverified_post = any(r.method == "POST" and r.status == "Manual action required"
+                                                  for r in outcomes)
+                            if not unverified_post or states & (SUCCESS_STATUSES | UNCERTAIN_STATUSES):
+                                seen.add(candidate.key)
+                            if states & SUCCESS_STATUSES:
+                                stats["accepted"] += 1
+                            elif states & UNCERTAIN_STATUSES:
+                                stats["unknown"] += 1
+                            elif "Already submitted" in states:
+                                stats["duplicates"] += 1
+                            elif "Manual action required" in states:
+                                stats["manual"] += 1
+                            elif states:
+                                stats["failed"] += 1
+                    except BaseException:
+                        checkpoint_ok = terminal_read_failure
+                        raise
                     finally:
-                        states = {result.status for result in outcomes}
-                        # Another copy may pass DKIM, so don't rule it out after this one fails.
-                        unverified_post = any(r.method == "POST" and r.status == "Manual action required" for r in outcomes)
-                        if not unverified_post or states & (SUCCESS_STATUSES | UNCERTAIN_STATUSES):
-                            seen.add(candidate.key)
-                        if states & SUCCESS_STATUSES:
-                            stats['accepted'] += 1
-                        elif states & UNCERTAIN_STATUSES:
-                            stats['unknown'] += 1
-                        elif "Already submitted" in states:
-                            stats['duplicates'] += 1
-                        elif "Manual action required" in states:
-                            stats['manual'] += 1
-                        elif states:
-                            stats['failed'] += 1
-                finally:
-                    emit("progress", ProgressUpdate(stats['checked'], len(ids),
-                         f"Checked {stats['checked']:,} messages; {stats['found']:,} unsubscribe entries found."))
-            emit("progress", ProgressUpdate(stats['checked'], len(ids), "Finishing scan and updating results..."))
-            emit("log", "Finished. Accepted/submitted requests do not independently confirm removal." if automatic else
-                 "Scan finished. Check the senders you want to unsubscribe from, then click Unsubscribe checked.")
+                        if checkpoint_ok:
+                            stats["checked"] += 1
+                            if history is not None:
+                                history.checkpoint(run_id, folder, uid, info, candidate, unreadable, stats,
+                                                   bool(candidate and candidate.key in seen))
+                            emit("progress", ProgressUpdate(stats["checked"], total,
+                                 f"Checked {stats['checked']:,}/{total:,} messages. {stats['found']:,} entries found."))
+            completed_run = True
+            emit("progress", ProgressUpdate(stats["checked"], total, "Finishing scan and updating results..."))
+            emit("log", "Scan finished. Submitting a request does not independently confirm list removal." if automatic
+                 else "Scan finished. Check senders, then choose Unsubscribe checked.")
     finally:
+        if history is not None and run_id is not None:
+            history.state(run_id, "complete" if completed_run else "interrupted")
         emit("summary", stats.copy())
         emit("log", "Run summary: " + run_summary(stats))
 
@@ -1419,8 +1604,19 @@ def scan_limit_label(limit: int) -> str:
     return "Entire inbox" if limit == 0 else f"Newest {limit:,} messages"
 
 
-SORT_CHOICES = ("Sender", "Subject", "Latest email")
+SORT_CHOICES = ("Sender", "Subject", "Latest email", "Outcome")
 UTC_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def outcome_category(status: str) -> str:
+    if status in SUCCESS_STATUSES | {"Already submitted", "Submitted"}:
+        return "Successful"
+    if status in {"Failed", "Blocked"}:
+        return "Failed"
+    if status in UNCERTAIN_STATUSES or status.startswith("Mixed") or status in {
+            "Manual action required", "Needs attention", "Partial email submission"}:
+        return "Needs attention"
+    return "Pending"
 
 
 def parse_sent_date(message: Any) -> datetime | None:
@@ -1444,11 +1640,12 @@ class MessageInfo:
     sender_email: str
     subject: str
     sent_at: datetime | None
+    folder: str = "INBOX"
 
     @property
     def sender_key(self) -> str:
         # Don't group unrelated messages just because both lack a From address.
-        identity = self.sender_email.casefold() or f"unknown:{self.uid}"
+        identity = self.sender_email.casefold() or f"unknown:{self.folder}:{self.uid}"
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     @property
@@ -1457,17 +1654,17 @@ class MessageInfo:
                 int(self.uid) if self.uid.isdigit() else 0)
 
 
-def parse_message_info(raw: bytes, uid: str) -> MessageInfo:
+def parse_message_info(raw: bytes, uid: str, *, folder: str = "INBOX") -> MessageInfo:
     message = BytesHeaderParser(policy=policy.compat32).parsebytes(raw)
     name, address = parseaddr(decode_mime_header(message.get("From")))
     return MessageInfo(uid, display_text(name or address or "Unknown sender"),
                        display_text(address), decode_mime_header(message.get("Subject")),
-                       parse_sent_date(message))
+                        parse_sent_date(message), folder)
 
 
 def candidate_info(candidate: Candidate) -> MessageInfo:
     return MessageInfo(candidate.uid, candidate.sender_name, candidate.sender_email,
-                       candidate.subject, candidate.sent_at)
+                        candidate.subject, candidate.sent_at, candidate.folder)
 
 
 def display_date(date: datetime | None) -> str:
@@ -1497,7 +1694,7 @@ class SenderRow:
         return self.latest.sender_key
 
     def add_message(self, info: MessageInfo) -> None:
-        self.message_uids.add(info.uid)
+        self.message_uids.add(f"{info.folder}:{info.uid}")
         if info.latest_key > self.latest.latest_key:
             self.latest = info
         self.terms.update((info.sender_name.casefold(), info.sender_email.casefold(), info.subject.casefold()))
@@ -1505,7 +1702,7 @@ class SenderRow:
 
     def add_candidate(self, candidate: Candidate) -> None:
         self.add_message(candidate_info(candidate))
-        self.entries[f"{candidate.validity}:{candidate.uid}"] = candidate
+        self.entries[f"{candidate.folder}:{candidate.validity}:{candidate.uid}"] = candidate
         self.groups.add(subscription_key(candidate) or candidate.key)
         self.terms.add(candidate.list_id.casefold())
         self._search_dirty = True
@@ -1540,16 +1737,21 @@ class SenderRow:
         return len(self.groups)
 
 
-def sorted_sender_rows(rows: list[SenderRow], sort_by: str, descending: bool) -> list[SenderRow]:
+def sorted_sender_rows(rows: list[SenderRow], sort_by: str, descending: bool,
+                       status_for: Callable[[SenderRow], str] | None = None) -> list[SenderRow]:
     def text_key(row: SenderRow) -> tuple[str, str, str]:
         primary = row.latest.subject if sort_by == "Subject" else row.latest.sender_name
         return primary.casefold(), row.latest.sender_email.casefold(), row.key
 
+    if sort_by == "Outcome" and status_for is not None:
+        # Default order puts failed and uncertain results first.
+        priority = {"Failed": 0, "Needs attention": 1, "Pending": 2, "Successful": 3}
+        return sorted(rows, key=lambda row: (priority[outcome_category(status_for(row))],
+                                              row.latest.sender_name.casefold(), row.key), reverse=descending)
     if sort_by != "Latest email":
         return sorted(rows, key=text_key, reverse=descending)
     dated = [row for row in rows if row.latest.sent_at is not None]
     unknown = [row for row in rows if row.latest.sent_at is None]
-    # Break ties consistently and keep unknown dates last.
     dated.sort(key=lambda row: (row.latest.sender_name.casefold(), row.key))
     dated.sort(key=lambda row: row.latest.sent_at, reverse=descending)
     return dated + sorted(unknown, key=text_key)
@@ -1559,7 +1761,7 @@ class UnsubscribeApp:
     def __init__(self, root: tk.Tk, *, administrator: bool = False) -> None:
         self.root = root
         self.administrator = administrator
-        self.root.title("Gmail Unsubscriber - Live Progress" + (" - Administrator" if administrator else ""))
+        self.root.title(f"Gmail Unsubscriber v{APP_VERSION}" + (" - Administrator" if administrator else ""))
         width = min(1180, max(760, self.root.winfo_screenwidth() - 80))
         height = min(850, max(620, self.root.winfo_screenheight() - 90))
         self.root.geometry(f"{width}x{height}+{max(0, (self.root.winfo_screenwidth() - width) // 2)}+30")
@@ -1589,6 +1791,7 @@ class UnsubscribeApp:
         self.task_had_error = False
         self.last_summary: dict[str, int] | None = None
         self.scan_account = ""
+        self.current_run_id: int | None = None
         self.candidates: dict[str, Candidate] = {}
         self.senders: dict[str, SenderRow] = {}
         self.checked_senders: set[str] = set()
@@ -1655,9 +1858,20 @@ class UnsubscribeApp:
         ttk.Label(amounts, text="  Newest messages first").pack(side=tk.RIGHT)
         self.auto_var = tk.BooleanVar(value=False)
         self.auto_cb = ttk.Checkbutton(options, text="Auto unsubscribe while scanning", variable=self.auto_var)
-        self.auto_cb.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(7, 2))
-        self.mode_hint = ttk.Label(options, text="", wraplength=1040)
-        self.mode_hint.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+        self.auto_cb.grid(row=1, column=0, sticky=tk.W, pady=(7, 2))
+        self.spam_var = tk.BooleanVar(value=False)
+        self.spam_cb = ttk.Checkbutton(options, text="Include Spam", variable=self.spam_var,
+                                       command=self._mode_changed)
+        self.spam_cb.grid(row=1, column=1, sticky=tk.W, padx=(8, 0), pady=(7, 2))
+        self.resume_var = tk.BooleanVar(value=True)
+        self.resume_cb = ttk.Checkbutton(options, text="Resume scan", variable=self.resume_var)
+        self.resume_cb.grid(row=1, column=2, sticky=tk.W, padx=(8, 0), pady=(7, 2))
+        self.fallback_var = tk.BooleanVar(value=False)
+        self.fallback_cb = ttk.Checkbutton(options, text="Email sender if auto unsubscribe is unavailable",
+                                           variable=self.fallback_var, command=self._fallback_changed)
+        self.fallback_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+        self.mode_hint = ttk.Label(options, text="", wraplength=260)
+        self.mode_hint.grid(row=2, column=2, sticky=tk.W, pady=(0, 4))
         export_row = ttk.Frame(options)
         export_row.grid(row=3, column=0, columnspan=3, sticky=tk.EW)
         export_row.columnconfigure(1, weight=1)
@@ -1725,6 +1939,7 @@ class UnsubscribeApp:
                              stretch=name in {"sender", "subject", "status"},
                              anchor=tk.CENTER if name in {"checked", "lists"} else tk.W)
         self.tree.heading("checked", command=self.toggle_visible)
+        self.tree.heading("status", command=lambda: self.sort_by_heading("Outcome"))
         for column, sort in (("sender", "Sender"), ("subject", "Subject"), ("date", "Latest email")):
             self.tree.heading(column, command=lambda by=sort: self.sort_by_heading(by))
         self.tree.grid(row=0, column=0, sticky=tk.NSEW)
@@ -1799,13 +2014,26 @@ class UnsubscribeApp:
         auto = self.auto_var.get()
         if auto:
             self.checked_senders.clear()
-        self.mode_hint.configure(text=(
-            "On: Start sends requests as lists are found, including unsubscribe emails. No per-sender approval." if auto else
-            "Off: scan only. Check senders below, then click Unsubscribe checked."))
-        self.start_btn.configure(text="Scan + auto unsubscribe" if auto else "Scan inbox")
+        hint = "Auto: submits INBOX requests." if auto else "Scan: review before sending."
+        if self.fallback_var.get():
+            hint += " Request emails: INBOX lists only."
+        if self.spam_var.get() and auto:
+            hint += " Spam: review only."
+        self.mode_hint.configure(text=hint)
+        self.start_btn.configure(text="Scan + auto unsubscribe" if auto else
+                                 "Scan inbox + Spam" if self.spam_var.get() else "Scan inbox")
         self._dirty_rows.update(self.senders)
         self.schedule_refresh()
         self.update_controls()
+
+    def _fallback_changed(self) -> None:
+        if self.fallback_var.get() and not messagebox.askyesno(
+                "Email fallback", "Send a plain unsubscribe email to the list sender when there is no usable "
+                "automated method? This can reveal that your address is active. The app will not send this "
+                "fallback to Spam senders or ordinary personal messages.",
+                parent=self.root, default=messagebox.NO):
+            self.fallback_var.set(False)
+        self._mode_changed()
 
     def _sort_changed(self) -> None:
         if self.sort_var.get() != self._last_sort:
@@ -1817,6 +2045,8 @@ class UnsubscribeApp:
     def _sort_label(self) -> None:
         if self.sort_var.get() == "Latest email":
             text = "Newest first" if self.descending_var.get() else "Oldest first"
+        elif self.sort_var.get() == "Outcome":
+            text = "Success first" if self.descending_var.get() else "Failure first"
         else:
             text = "Z to A" if self.descending_var.get() else "A to Z"
         self.sort_direction_btn.configure(text=text)
@@ -1841,7 +2071,7 @@ class UnsubscribeApp:
         idle = not self.is_running and not self.closing
         state = tk.NORMAL if idle else tk.DISABLED
         for widget in (self.email_entry, self.pass_entry, self.show_pass_cb, self.auto_cb, self.save_cb,
-                       self.start_btn, self.connection_btn):
+                       self.spam_cb, self.fallback_cb, self.resume_cb, self.start_btn, self.connection_btn):
             widget.configure(state=state)
         self.scan_amount.configure(state="readonly" if idle else tk.DISABLED)
         self.custom_entry.configure(state=tk.NORMAL if idle and self.scan_choice_var.get() == "Custom" else tk.DISABLED)
@@ -1892,7 +2122,7 @@ class UnsubscribeApp:
         if candidate.key in self.entry_statuses:
             return self.entry_statuses[candidate.key]
         methods = {target.method for target in candidate.targets}
-        if not methods.intersection({"POST", "MAILTO"}):
+        if not methods.intersection({"POST", "MAILTO", "REQUEST"}):
             return "Manual action required" if "MANUAL" in methods else "Blocked"
         return "Processing" if self.active_task == "auto" and self.is_running else "Not submitted"
 
@@ -1948,7 +2178,8 @@ class UnsubscribeApp:
                 break
         query = self.search_var.get()
         rows = [self.senders[key] for key in self._all_tree_keys if self.senders[key].matches(query)]
-        ordered = sorted_sender_rows(rows, self.sort_var.get(), self.descending_var.get())
+        ordered = sorted_sender_rows(rows, self.sort_var.get(), self.descending_var.get(),
+                                     status_for=self._sender_status)
         self.visible_keys = tuple(row.key for row in ordered)
         # Keep row IDs and checkbox state when sorting or hiding rows.
         self.tree.set_children("", *self.visible_keys)
@@ -2075,13 +2306,16 @@ class UnsubscribeApp:
         if not credentials:
             return
         automatic = bool(self.auto_var.get())
+        include_spam = bool(self.spam_var.get())
+        request_fallback = bool(self.fallback_var.get())
+        resume = bool(self.resume_var.get())
         if limit == 0:
             detail = ("Auto unsubscribe is ON. Supported lists will receive requests as they are found, "
                       "including emails from your account. Sent requests cannot be recalled." if automatic else
                       "Auto unsubscribe is OFF. No unsubscribe requests will be sent during this scan.")
-            if not messagebox.askyesno("Scan entire inbox?",
-                "Scan every message currently in INBOX?\n\nThis can take longer than a limited scan. "
-                "Archived mail, Spam, and Trash are not included.\n\n" + detail,
+            if not messagebox.askyesno("Scan all selected folders?",
+                "Scan every message in INBOX" + (" and Spam" if self.spam_var.get() else "") +
+                "?\n\nArchived mail and Trash are excluded.\n\n" + detail,
                 parent=self.root, default=messagebox.NO):
                 return
         allowed, export_path = self._prepare_export() if automatic else (True, None)
@@ -2089,6 +2323,7 @@ class UnsubscribeApp:
             return
         self.active_task = "auto" if automatic else "scan"
         self.scan_account = credentials[0]
+        self.current_run_id = None
         self.candidates.clear()
         self.senders.clear()
         self.checked_senders.clear()
@@ -2111,7 +2346,10 @@ class UnsubscribeApp:
 
         def job(account: str, password: str, amount: int,
                 *, guard: NetworkGuard, emit: Callable[[str, Any], None]) -> None:
-            scan_and_unsubscribe(account, password, amount, guard, self.ledger, emit, automatic=automatic)
+            with HistoryStore() as history:
+                scan_and_unsubscribe(account, password, amount, guard, self.ledger, emit,
+                                     automatic=automatic, include_spam=include_spam,
+                                     request_fallback=request_fallback, history=history, resume=resume)
 
         self._start_worker(job, (*credentials, limit), credentials[1])
 
@@ -2132,7 +2370,9 @@ class UnsubscribeApp:
             return
         hidden = len(self.checked_senders.difference(self.visible_keys))
         notice = f"Send unsubscribe requests for {len(rows):,} checked senders?\n\n"
-        notice += "All distinct mailing lists found for these senders are included. Requests may send email from your account."
+        notice += "All distinct lists found for these senders are included. Requests may send email from your account."
+        if self.fallback_var.get():
+            notice += " Plain request emails can reveal an active address."
         if hidden:
             notice += f"\n\n{hidden:,} checked senders are hidden by the current search and WILL be included."
         if not messagebox.askyesno("Unsubscribe checked senders?", notice, parent=self.root, default=messagebox.NO):
@@ -2148,7 +2388,9 @@ class UnsubscribeApp:
 
         def job(account: str, password: str, selected: tuple[Candidate, ...],
                 *, guard: NetworkGuard, emit: Callable[[str, Any], None]) -> None:
-            process_selected(selected, account, password, guard, self.ledger, emit)
+            with HistoryStore() as history:
+                process_selected(selected, account, password, guard, self.ledger, emit,
+                                 history=history, run_id=self.current_run_id)
 
         self._start_worker(job, (*credentials, candidates), credentials[1])
 
@@ -2249,6 +2491,8 @@ class UnsubscribeApp:
                     self.senders[sender_key].set_status(candidate, self._entry_status(candidate))
                 self._dirty_rows.add(sender_key)
                 changed = True
+            elif kind == "run_id":
+                self.current_run_id = payload
             elif kind == "summary":
                 self.last_summary = payload
             elif kind == "result":
@@ -2431,7 +2675,7 @@ class UnsubscribeApp:
             return
         if self.is_running:
             if not messagebox.askyesno("Stop and close?", "Stop further work and close once the worker exits?\n"
-                                      "Already-sent requests cannot be recalled. Unexported results will be lost.",
+                                      "Sent requests cannot be recalled. Scan progress and outcomes are saved locally.",
                                       parent=self.root, default=messagebox.NO):
                 return
             self.closing = True

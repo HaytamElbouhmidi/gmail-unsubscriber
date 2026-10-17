@@ -40,6 +40,8 @@ def launch_flags(arguments: Sequence[str]) -> list[str]:
 
 def python_executable(*, windowed: bool, executable: str | None = None) -> str:
     """Find python or pythonw in the current environment."""
+    if not IS_WINDOWS and executable is not None:
+        return executable
     current = Path(executable or sys.executable).absolute()
     if IS_WINDOWS:
         name = "pythonw.exe" if windowed else "python.exe"

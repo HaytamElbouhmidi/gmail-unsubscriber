@@ -283,7 +283,11 @@ class SenderControlsGuiTests(OfflineCase):
         with patch.object(u, "process_selected") as process:
             guard, emit = u.NetworkGuard(), MagicMock()
             target(*args, guard=guard, emit=emit)
-        process.assert_called_once_with(args[2], ACCOUNT, PASSWORD, guard, self.app.ledger, emit)
+        process.assert_called_once()
+        self.assertEqual(process.call_args.args,
+                         (args[2], ACCOUNT, PASSWORD, guard, self.app.ledger, emit))
+        self.assertIsNotNone(process.call_args.kwargs["history"])
+        self.assertEqual(process.call_args.kwargs["run_id"], None)
 
     def test_cancelling_manual_confirmation_starts_nothing(self):
         self.add(item())

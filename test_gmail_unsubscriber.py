@@ -66,6 +66,10 @@ class OfflineCase(unittest.TestCase):
         # Collect old Tk windows on the main thread before starting workers.
         gc.collect()
         self.addCleanup(patch.stopall)
+        state_folder = tempfile.TemporaryDirectory()
+        self.addCleanup(state_folder.cleanup)
+        patch.dict(os.environ, {"XDG_STATE_HOME": state_folder.name,
+                                    "LOCALAPPDATA": state_folder.name}).start()
         for name in ("socket.socket.connect", "socket.socket.connect_ex", "socket.socket.sendto"):
             patch(name, side_effect=AssertionError("Live network is forbidden in regression tests")).start()
         patch("socket.getaddrinfo", side_effect=AssertionError("Live DNS is forbidden in regression tests")).start()

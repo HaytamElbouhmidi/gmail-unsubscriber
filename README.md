@@ -1,118 +1,144 @@
 # Gmail Unsubscriber
 
-Scan your Gmail inbox, find mailing lists, and unsubscribe from the senders you choose. Or turn on auto unsubscribe to send requests while it scans.
+**Version 3.1.0 | Windows and Linux | Python 3.10+**
 
-![Gmail Unsubscriber with two senders checked and the scan settings visible](docs/images/overview.png)
+Scan Gmail mailing lists, choose which senders to unsubscribe from, and review the results. Auto unsubscribe is available as an option. The desktop interface stays lightweight and uses the original Tkinter layout.
 
-*Sample inbox data. Captured from the app on Linux; Windows styling may differ.*
+![Gmail Unsubscriber with sample sender results and scan settings](docs/images/overview.png)
+
+*Screenshots use sample email records. They are captured from the actual Tkinter application without accessing Gmail. The appearance of native controls may differ between Windows and Linux.*
 
 <details>
 <summary>More screenshots</summary>
 
-### Scan amount
+### Scan amount and folders
 
-Choose a preset, enter a custom count, or scan the entire inbox.
+Choose 250, 500, 1,000, Custom, or Entire inbox. **Include Spam** also examines the Spam mailbox. In automatic mode, Spam results are for review only.
 
-![Scan amount dropdown showing 250, 500, 1,000, Custom, and Entire inbox](docs/images/scan-amounts.png)
+![Scan amount and optional Spam controls](docs/images/scan-amounts.png)
 
 ### Auto unsubscribe
 
-Turn it on to send requests while scanning. Here it's set to a custom count of 2,500 messages.
+Auto unsubscribe is off by default. When enabled, valid one-click and email-based unsubscribe requests can be submitted as INBOX messages are examined.
 
-![Auto unsubscribe enabled with a custom scan amount of 2,500 messages](docs/images/auto-unsubscribe.png)
+![Automatic unsubscribe option](docs/images/auto-unsubscribe.png)
 
-### Search and sort
+### Search and outcome sorting
 
-Results filter as you type. Sort by sender, subject, or latest email. Checked senders stay checked even when a search hides them.
+Search locally and sort by Sender, Subject, Latest email, or **Outcome**. Click the Outcome column to reverse the order and bring failures or successful submissions together.
 
-![Search for python showing two matching senders, the sort choices, and one hidden checked sender](docs/images/search-and-sort.png)
+![Sorting outcomes in the senders table](docs/images/search-and-sort.png)
 
-### Entire-inbox confirmation
+### Scan progress and resume
 
-This appears when you start an entire-inbox scan, not a limited scan.
+The scan counts examined messages and keeps the progress bar updated. The **Resume scan** checkbox uses a local checkpoint to skip messages that were processed in a previous interrupted run with the same settings.
 
-![Confirmation before scanning every message in INBOX](docs/images/entire-inbox-confirmation.png)
+![Progress while scanning synthetic messages](docs/images/scan-progress.png)
 
-### Scan progress
+![Stopped scan with resumable local progress](docs/images/resume.png)
 
-The counter updates during the scan, including messages without unsubscribe links.
+On completion, the bar stays full. Complete means the scan finished, not that all removal requests succeeded.
 
-![Scan in progress showing 12,450 of 40,818 messages checked](docs/images/scan-progress.png)
-
-The bar stays full when the run finishes. Complete means the run finished, not that every unsubscribe request succeeded.
-
-![Completed scan showing 40,818 of 40,818 messages checked and a full progress bar](docs/images/scan-complete.png)
+![Completed scan with synthetic results](docs/images/scan-complete.png)
 
 </details>
 
 ## Setup
 
-You'll need Python 3.10 or newer with Tkinter and a Google app password. Your regular Gmail password won't work.
+You'll need Python 3.10 or newer with Tkinter, the dependencies in `requirements.txt`, and a Google app password. Your regular Gmail password won't work.
 
-1. Download the ZIP and extract it. Keep the files together.
-2. Double-click `Gmail Unsubscriber.pyw`.
-3. Allow dependency installation if prompted.
+1. Download the source ZIP or clone the repository and keep the files together.
+2. On Windows, open `Gmail Unsubscriber (Standard Mode).pyw` or use `Start Gmail Unsubscriber.cmd`.
+3. Allow dependency installation if prompted. On Linux, use `python gmail_unsubscriber.py` after installing requirements.
 
-The default launcher requests administrator access. Gmail doesn't need it, so `Gmail Unsubscriber (Standard Mode).pyw` is also included. If double-clicking opens an editor, use `Start Gmail Unsubscriber.cmd`.
-
-Upgrading from the previous Auto Unsubscribe version? Close the app and replace `gmail_unsubscriber.py`. The launchers and dependencies haven't changed.
+Administrator access is not needed to scan Gmail. The standard Windows launcher avoids an unnecessary elevation request.
 
 ## Use it
 
-Enter your Gmail address and app password. The **Google app passwords** button opens the account page.
+Enter your Gmail address and app password. **Google app passwords** opens the account page.
 
-Set **Scan amount** to **250**, **500**, **1,000**, **Custom**, or **Entire inbox**. Enter custom counts in the field beside the dropdown. Start uses this setting directly. Only an entire-inbox scan asks for confirmation, once when you press Start.
+**Scan amount** supports **250**, **500**, **1,000**, **Custom**, and **Entire inbox**. The last option asks for confirmation before scanning all selected folders. With **Include Spam** and a limited scan, the limit is shared between INBOX and Spam, with unused capacity taken from the other folder. Archived messages and Trash are not scanned.
 
-**Auto unsubscribe is off by default.** Click **Scan inbox**, check the boxes beside the senders you want to remove, then click **Unsubscribe checked**. Checkboxes can be set while scanning; sending is enabled after the scan finishes or stops. Highlighting a row does not check it.
+**Auto unsubscribe while scanning is off by default.** Click **Scan inbox**, check the senders you want to remove, and click **Unsubscribe checked**. You may check senders while scanning, but requests are submitted only after scanning stops or finishes. Merely highlighting a row does not check its box.
 
-With **Auto unsubscribe while scanning** turned on, click **Scan + auto unsubscribe**. Supported requests are sent immediately, including unsubscribe emails from your account. There's no per-sender approval in this mode.
+With auto mode on, choose **Scan + auto unsubscribe**. Supported INBOX requests are submitted while scanning, without per-sender approval. **Spam is always scanned for review only in auto mode.** To act on a Spam sender, use scan-only mode and check it manually. Scanning never deletes, moves, or marks messages as read.
 
-The progress bar shows how many messages have been checked and the percentage done. The status line shows the current step and elapsed time, including time spent waiting for Gmail. When the run finishes, the bar stays full and shows **Complete**. Stopped or failed runs keep their partial progress and show **Stopped** or **Error** instead. Complete means the scan or batch finished, not that every unsubscribe request succeeded.
+### Optional plain unsubscribe request emails
 
-**Stop** cancels further work. It can't undo a request already sent.
+Check **Email sender if auto unsubscribe is unavailable** to permit a direct unsubscribe request from your Gmail account when supported automatic methods are not available or unsuccessful. This is separate from the auto unsubscribe setting. The app only enables this extra option for identifiable INBOX mailing-list messages with a `List-ID`, `List-Unsubscribe`, or list/bulk `Precedence` header and a usable sender address. It does not use this fallback for Spam, ordinary messages without list identification, or common no-reply addresses.
 
-## Find and select senders
+A request email asks for removal but cannot guarantee it. It may also reveal that the account is active, so **the option is off by default**. Existing `mailto:` unsubscribe instructions still take priority. Requests requiring confirmation on a webpage are not submitted as one-click operations.
 
-Each address gets one row showing its latest scanned subject, sent date, list count, and outcome. Checking a sender includes all distinct mailing lists found for that address.
+### Resume an interrupted scan
 
-**Search** filters as you type. It matches sender names, email addresses, scanned subjects, and List-IDs, including older subjects that aren't shown in the row. It doesn't contact Gmail again or search message bodies.
+Leave **Resume scan** checked to continue after stopping the program, a crash, or a restart. Progress is saved locally. On the next run, enter the same Gmail account and select the same scan amount, folders, and mode. The app restores the previous scan results, skips completed message UIDs, and processes the remaining messages. It checks mailbox UIDVALIDITY so a mailbox reset will not mix up saved UIDs and current messages.
 
-**Sort by** sender, subject, or latest email. Use the direction button to reverse the order, or click a column heading. Dates come from the email's `Date` header, are displayed in your local time, and only cover messages in this scan. Missing or invalid dates appear as **Unknown** at the bottom.
+Uncheck **Resume scan** to start a new scan. The durable request history still protects accepted or uncertain requests from being automatically resent. If a request was interrupted during delivery, its status may be **Outcome unknown** and it is not repeated automatically.
 
-**Check shown** selects only the filtered results. Checked senders stay checked when sorting or filtering hides them. Their count stays visible, and the send confirmation explicitly includes any hidden selections. **Clear checks** clears them all.
+**Stop** cancels subsequent work. It cannot recall an HTTP request or email that was already sent.
 
-Double-click a sender or use **View details** to inspect its lists and outcomes. The table only shows senders with unsubscribe headers. Unrelated inbox messages aren't presented as subscriptions.
+## Find, sort, and select senders
+
+Each sender gets a row showing its most recent scanned subject, date, number of mailing lists, and outcome. Searching matches sender names, addresses, subject lines, and List-IDs including earlier scanned subjects. Search and sorting are local operations, with no extra Gmail requests.
+
+**Sort by** includes **Sender**, **Subject**, **Latest email**, and **Outcome**. Click the Outcome heading or use the direction button to group failed and successful results. The date column uses the email's `Date` header in local time. Unknown dates appear at the bottom when sorting by date.
+
+**Check shown** selects the visible filtered rows only. **Clear checks** removes all selections. Checked senders remain selected when search or sorting hides them. Double-click a sender or use **View details** to inspect target URLs, distinct lists, and method outcomes.
 
 ## Results and limits
 
-Supported HTTPS one-click requests and email-based unsubscribe links are handled automatically. One-click requests require DKIM verification. Confirmation webpages are marked **Manual action required**; the app doesn't fill out forms or search email bodies for unsubscribe buttons.
+The app handles supported HTTPS one-click unsubscribe requests and `mailto:` addresses in the `List-Unsubscribe` header. HTTPS one-click submission requires DKIM verification. Web confirmation pages are flagged as **Manual action required** and are not opened or completed automatically.
 
-**Entire inbox** covers INBOX, not archived mail, Spam, or Trash. Messages aren't deleted, archived, or marked as read. The scan checks the newest message UIDs first; changing the table sort only changes the view.
+**Request accepted** means the endpoint accepted the HTTP request. **Email submitted** means Gmail's SMTP service accepted the email. Neither proves the mailing list removed the address. **Failed** and **Blocked** indicate unsuccessful or unsafe attempts. **Outcome unknown** indicates the request might have been delivered, so it will not be automatically repeated. Different outcomes for one sender are shown as **Mixed outcomes**.
 
-**Request accepted** and **Email submitted** mean the request went through, not that the sender removed you. **Outcome unknown** means a request may have been sent; it isn't automatically repeated. A sender with different list outcomes shows **Mixed outcomes** rather than claiming everything succeeded.
+Use **Export results** for a CSV snapshot or enable automatic export. Results can include private email addresses and unsubscribe links. Do not commit exported results to GitHub.
 
-Use **Export results** to save request outcomes as CSV, or enable automatic export before sending. Scan-only runs don't create a request-outcome report. Passwords aren't saved. Message headers and results stay in memory, and full messages may be fetched in memory for DKIM checks. Closing the app clears results and duplicate tracking.
+### Local scan history
 
-CSV files contain private account details and unsubscribe links. Don't commit them to GitHub or attach unredacted exports to issues. Automatic processing can't tell which subscriptions you want to keep.
+Version 3.1.0 uses a local SQLite database, separate from the application source:
+
+| System | Location |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\gmail-unsubscriber\progress.sqlite3` |
+| Linux | `${XDG_STATE_HOME:-~/.local/state}/gmail-unsubscriber/progress.sqlite3` |
+
+It saves mailbox UIDs, header metadata, scan configuration, request results, and a per-account delivery ledger. It does not store your Gmail app password or email bodies. The database is **not encrypted** and may contain private unsubscribe URLs or tokens. Keep it private and never upload it to your repository.
+
+Resuming prevents repeated scanning of checkpointed messages. Requests are reserved in the ledger before delivery to limit duplicate submissions even if the program exits suddenly. A request without a definitive response stays uncertain. Removing the database also removes this protection and should only be done intentionally with the application closed.
 
 ## Problems?
 
-Run **Test connection** and check the Activity log. A passing test checks connectivity, not your password or authenticated mailbox commands. Both scan modes use reconnect-and-retry handling for mailbox reads. Repeated failures can still stop a batch.
+Use **Test connection** and check the Activity log. Passing connection tests only verifies network connectivity, not your Gmail credentials. Mailbox reads use bounded retry and reconnect handling. Repeated failures can stop a scan while retaining its saved progress.
 
-For setup errors, keep the files from the same release together. In bug reports, include your Python version and the relevant error, with passwords, email addresses, and unsubscribe tokens removed.
+For setup issues, keep all source files from the same version together and include sanitized errors when reporting a problem. Remove account addresses, passwords, tokens, and private links from reports.
 
 ## Tests
 
-With the requirements installed, run:
+Install requirements and run:
 
 ```sh
 python -m unittest discover -v
 ```
 
-GUI tests need a desktop display. On Linux with Xvfb, use `xvfb-run -a python -m unittest discover -v`.
+GUI tests require a desktop session. On Linux with Xvfb:
 
-The included test report covers offline checks. Gmail connections and unsubscribe submissions are mocked. These tests don't verify live Gmail access or native Windows behavior.
+```sh
+xvfb-run -a python -m unittest discover -v
+```
+
+To refresh these README screenshots from the running application with synthetic data, install Pillow in your development environment and run:
+
+```sh
+python -m pip install pillow
+python capture_readme.py
+```
+
+The tests mock Gmail, HTTP, SMTP, and DKIM verification. Offline tests cannot confirm that a live sender will accept an unsubscribe request.
 
 ## Support
 
-Find it useful? Support my work on [Ko-fi](https://ko-fi.com/haytamelbouhmidi) or [Patreon](https://www.patreon.com/c/HaytamElbouhmidi).
+Support my work on [Ko-fi](https://ko-fi.com/haytamelbouhmidi) or [Patreon](https://www.patreon.com/c/HaytamElbouhmidi).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
