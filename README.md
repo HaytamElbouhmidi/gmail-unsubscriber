@@ -1,6 +1,6 @@
 # Gmail Unsubscriber
 
-**Version 3.1.2 | Windows and Linux | Python 3.10+**
+**Version 3.1.3 | Windows and Linux | Python 3.10+**
 
 Scan Gmail mailing lists, choose which senders to unsubscribe from, and review the results. Auto unsubscribe is available as an option. The desktop interface stays lightweight and uses the original Tkinter layout.
 
@@ -86,6 +86,8 @@ Each sender gets a row showing its most recent scanned subject, date, number of 
 **Check shown** selects the visible filtered rows only. **Clear checks** removes all selections. Checked senders remain selected when search or sorting hides them. Double-click a sender or use **View details** to inspect target URLs, distinct lists, and method outcomes.
 
 ## Results and limits
+
+On Windows, if Python DNS queries for DKIM TXT keys time out, the app retries the lookup using the built-in Windows `Resolve-DnsName` command. This uses the system DNS configuration, not a hardcoded public DNS provider. If native DNS succeeds, subsequent DKIM lookups in that scan prefer the Windows resolver. The lookup is bounded, responds to Stop, and accepts exactly one TXT record for a signing key. A successful key lookup does not count as DKIM verification: the cryptographic signature must still pass before a POST is sent. Only one-minute per-scan key caching is used; no keys or messages are written to disk. If the key cannot be verified, the request stays manual. Windows PowerShell is required for this DNS fallback. You can check both DNS paths using `python diagnose_dkim_dns.py` from the application directory.
 
 The app handles supported HTTPS one-click unsubscribe requests and `mailto:` addresses in the `List-Unsubscribe` header. HTTPS one-click submission requires DKIM verification. Web confirmation pages are flagged as **Manual action required** and are not opened or completed automatically.
 

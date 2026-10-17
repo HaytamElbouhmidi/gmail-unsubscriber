@@ -59,7 +59,9 @@ class DkimDiagnosticTests(OfflineCase):
         verifier = MagicMock()
         verifier.verify.side_effect = lambda idx, dnsfunc: bool(
             dnsfunc(b"selector._domainkey.example.com.", timeout=5))
-        with patch("dns.resolver.Resolver") as resolver:
+        with (patch("dns.resolver.Resolver") as resolver,
+              patch.object(u, "_windows_dkim_txt_lookup",
+                           return_value=(None, "Windows native DNS unavailable."))):
             resolver.return_value.resolve.side_effect = dns.exception.Timeout()
             (success, detail), _ = self.check(verifier)
         self.assertFalse(success)

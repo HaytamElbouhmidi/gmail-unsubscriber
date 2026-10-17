@@ -53,7 +53,7 @@ MAX_URI = 8192
 MAX_BODY = 64 * 1024
 POST_VALUE = "List-Unsubscribe=One-Click"
 POST_BODY = POST_VALUE.encode("ascii")
-APP_VERSION = "3.1.2"
+APP_VERSION = "3.1.3"
 HEADER_FIELDS = "FROM SUBJECT DATE LIST-ID PRECEDENCE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DKIM-SIGNATURE"
 # Use a plain header fetch. The IMAP reader enforces the size limit.
 FETCH_HEADERS = f"(BODY.PEEK[HEADER.FIELDS ({HEADER_FIELDS})])"
@@ -875,6 +875,114 @@ def fetch_for_verification(mail: Any, candidate: Candidate, guard: NetworkGuard)
     return raw
 
 
+def _windows_dkim_txt_lookup(name: bytes, guard: NetworkGuard) -> tuple[bytes | None, str]:
+    """Read one DKIM TXT record through Windows DNS when dnspython cannot reach DNS.
+
+    Pass the lookup name through an environment variable, not PowerShell source.
+    Never accept multiple TXT answers or use a public DNS server as a bypass.
+    """
+    import base64
+    import binascii
+    import subprocess
+
+    try:
+        hostname = name.decode("ascii").rstrip(".").lower()
+    except (AttributeError, UnicodeError):
+        return None, "Invalid DKIM DNS name."
+    if not (hostname and len(hostname) <= 253 and all(
+        re.fullmatch(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?", label)
+        for label in hostname.split(".")
+    )):
+        return None, "Invalid DKIM DNS name."
+
+    cache = getattr(guard, "_windows_dkim_key_cache", None)
+    if cache is None:
+        cache = {}
+        guard._windows_dkim_key_cache = cache
+    cached = cache.get(hostname)
+    if cached is not None and cached[0] > time.monotonic():
+        guard.check()
+        return cached[1], ""
+
+    script = r"""
+$ErrorActionPreference = 'Stop'
+try {
+    $result = Resolve-DnsName -Name $env:GMAIL_UNSUB_DKIM_QUERY -Type TXT -DnsOnly -ErrorAction Stop
+    $records = @($result | Where-Object { $_.Type -eq 'TXT' })
+    if ($records.Count -ne 1) {
+        Write-Output 'AMBIGUOUS_OR_MISSING'
+        exit 0
+    }
+    $record = $records[0].Strings -join ''
+    if ([string]::IsNullOrEmpty($record) -or $record -match '[^\x20-\x7e]') {
+        Write-Output 'INVALID_TXT'
+        exit 0
+    }
+    $bytes = [Text.Encoding]::ASCII.GetBytes($record)
+    Write-Output ('TXT:' + [Convert]::ToBase64String($bytes))
+}
+catch {
+    Write-Output 'LOOKUP_FAILED'
+}
+"""
+    guard.check()
+    environment = os.environ.copy()
+    environment["GMAIL_UNSUB_DKIM_QUERY"] = hostname + "."
+    powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                              "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    process = None
+    try:
+        process = subprocess.Popen(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=environment, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        deadline = time.monotonic() + 12.0
+        while True:
+            guard.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "Windows DNS query timed out."
+            try:
+                stdout, _ = process.communicate(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        guard.check()
+        if process.returncode != 0:
+            return None, "Windows DNS query could not complete."
+        response = stdout.strip()
+        if response == b"AMBIGUOUS_OR_MISSING":
+            return None, "Windows DNS returned zero or multiple DKIM TXT records."
+        if response == b"INVALID_TXT":
+            return None, "Windows DNS returned an invalid DKIM TXT record."
+        if not response.startswith(b"TXT:") or len(response) > 16384:
+            return None, "Windows DNS did not return a usable signing key."
+        try:
+            value = base64.b64decode(response[4:], validate=True)
+        except (binascii.Error, ValueError):
+            return None, "Windows DNS returned malformed signing-key data."
+        if not (0 < len(value) <= 8192):
+            return None, "Windows DNS returned an invalid signing-key length."
+        if len(cache) >= 128:
+            cache.clear()
+        cache[hostname] = (time.monotonic() + 60.0, value)
+        return value, ""
+    except OSError:
+        return None, "Windows native DNS lookup could not start."
+    finally:
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.communicate(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+
+
 def verify_one_click_dkim(raw: bytes, guard: NetworkGuard) -> tuple[bool, str]:
     """Require an authenticated DKIM signature covering both one-click headers.
 
@@ -900,9 +1008,19 @@ def verify_one_click_dkim(raw: bytes, guard: NetworkGuard) -> tuple[bool, str]:
     def dnsfunc(name: bytes, timeout: float = DNS_TIMEOUT) -> bytes | None:
         nonlocal dns_problem
         guard.check()
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = min(2.0, DNS_TIMEOUT)
+        native_attempted = False
+        native_problem = ""
+        if sys.platform == "win32" and getattr(guard, "_prefer_native_dkim_dns", False):
+            native_attempted = True
+            value, native_problem = _windows_dkim_txt_lookup(name, guard)
+            if value is not None:
+                return value
+            if "zero or multiple" in native_problem or "invalid DKIM" in native_problem:
+                dns_problem = native_problem
+                return None
         try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = min(2.0, DNS_TIMEOUT)
             answer = resolver.resolve(name.decode("ascii").rstrip(".") + ".", "TXT",
                                       search=False, lifetime=min(float(timeout), DNS_TIMEOUT))
             records = [b"".join(record.strings) for record in answer]
@@ -916,10 +1034,19 @@ def verify_one_click_dkim(raw: bytes, guard: NetworkGuard) -> tuple[bool, str]:
         except dns.resolver.NoAnswer:
             dns_problem = "DKIM signing key has no DNS TXT record."
         except dns.exception.Timeout:
-            dns_problem = "DKIM signing-key DNS lookup timed out."
+            if sys.platform == "win32":
+                if not native_attempted:
+                    value, native_problem = _windows_dkim_txt_lookup(name, guard)
+                    if value is not None:
+                        guard._prefer_native_dkim_dns = True
+                        return value
+                dns_problem = "DKIM DNS timed out. Windows native DNS: " + native_problem
+            else:
+                dns_problem = "DKIM signing-key DNS lookup timed out."
         except dns.exception.DNSException as exc:
             dns_problem = f"DKIM signing-key DNS lookup error ({type(exc).__name__})."
         return None
+
 
     eligible = False
     reasons: list[str] = []
