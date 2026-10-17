@@ -70,6 +70,7 @@ class OfflineCase(unittest.TestCase):
         self.addCleanup(state_folder.cleanup)
         patch.dict(os.environ, {"XDG_STATE_HOME": state_folder.name,
                                     "LOCALAPPDATA": state_folder.name}).start()
+        patch("scan_history.history_path", return_value=Path(state_folder.name) / "progress.sqlite3").start()
         for name in ("socket.socket.connect", "socket.socket.connect_ex", "socket.socket.sendto"):
             patch(name, side_effect=AssertionError("Live network is forbidden in regression tests")).start()
         patch("socket.getaddrinfo", side_effect=AssertionError("Live DNS is forbidden in regression tests")).start()

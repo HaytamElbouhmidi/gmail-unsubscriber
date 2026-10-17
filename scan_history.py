@@ -1,6 +1,6 @@
 """Durable per-account scan checkpoints and unsubscribe delivery ledger.
 
-Version 3.1.0. No credentials or message bodies are stored.
+Version 3.1.2. No credentials or message bodies are stored.
 """
 from __future__ import annotations
 
@@ -17,11 +17,75 @@ from typing import Any
 SCHEMA_VERSION = 1
 
 
+def _native_legacy_state(path: Path) -> str:
+    """Ask Windows PowerShell when packaged Python cannot inspect a legacy path.
+
+    Keep the filename on standard input, never in PowerShell source. This probe
+    must return a definite absent/present result or the caller fails closed.
+    """
+    import subprocess
+
+    script = r"""
+$path = [Console]::In.ReadToEnd().Trim()
+try {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($item -is [System.IO.FileInfo]) {
+        Write-Output 'FILE'
+    }
+    else {
+        Write-Output 'OTHER'
+    }
+}
+catch {
+    if ($_.Exception -is [System.Management.Automation.ItemNotFoundException] -or
+            $_.FullyQualifiedErrorId -match 'PathNotFound|ItemNotFound') {
+        Write-Output 'MISSING'
+    }
+    else {
+        Write-Output 'UNKNOWN'
+    }
+}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            input=str(path), capture_output=True, text=True, timeout=12,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "UNKNOWN"
+    state = result.stdout.strip()
+    return state if result.returncode == 0 and state in {"FILE", "MISSING", "OTHER"} else "UNKNOWN"
+
+
 def history_path() -> Path:
+    """Use the user profile on Windows without losing an existing AppData ledger.
+
+    Microsoft Store Python can redirect writes under AppData. A profile-local
+    directory works for standard installations. If an older database exists,
+    keep using it to preserve prior submissions and resume checkpoints.
+    """
     if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    else:
-        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+        legacy = (Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+                  / "gmail-unsubscriber" / "progress.sqlite3")
+        profile = Path.home() / ".gmail-unsubscriber" / "progress.sqlite3"
+        try:
+            if legacy.exists():
+                return legacy
+        except PermissionError as exc:
+            # Store Python sometimes reports WinError 5 for a missing AppData
+            # path. Never discard a real legacy ledger on an ambiguous result.
+            state = _native_legacy_state(legacy)
+            if state == "FILE":
+                return legacy
+            if state == "MISSING":
+                return profile
+            raise PermissionError(
+                f"Cannot safely determine whether the legacy scan-history file exists at {legacy}. "
+                "Windows PowerShell could not confirm its absence. Do not delete or replace saved history."
+            ) from exc
+        return profile
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
     return base / "gmail-unsubscriber" / "progress.sqlite3"
 
 
@@ -62,15 +126,19 @@ class HistoryStore:
     """Each thread owns a connection. Every change is committed before the next message."""
 
     def __init__(self, path: str | Path | None = None) -> None:
-        self.path = Path(path or history_path()).expanduser()
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if os.name != "nt":
-            self.path.parent.chmod(0o700)
-        self.db = sqlite3.connect(self.path, timeout=30)
-        if os.name != "nt":
-            self.path.chmod(0o600)
-        self.db.execute("PRAGMA busy_timeout = 30000")
-        self.db.executescript("""
+        self.path = Path(path if path is not None else history_path()).expanduser()
+        self.db: sqlite3.Connection | None = None
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if self.path.is_dir():
+                raise IsADirectoryError("The database filename is a folder, not a SQLite file.")
+            if os.name != "nt":
+                self.path.parent.chmod(0o700)
+            self.db = sqlite3.connect(self.path, timeout=30)
+            if os.name != "nt":
+                self.path.chmod(0o600)
+            self.db.execute("PRAGMA busy_timeout = 30000")
+            self.db.executescript("""
             CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY, account TEXT NOT NULL, settings TEXT NOT NULL,
                 mailboxes TEXT NOT NULL, stats TEXT NOT NULL, state TEXT NOT NULL,
@@ -94,8 +162,17 @@ class HistoryStore:
                 account TEXT NOT NULL, method TEXT NOT NULL, target TEXT NOT NULL,
                 status TEXT NOT NULL, PRIMARY KEY(account, method, target)
             );
-        """)
-        self.db.commit()
+            """)
+            self.db.commit()
+        except (OSError, sqlite3.DatabaseError) as exc:
+            if self.db is not None:
+                self.db.close()
+            raise sqlite3.OperationalError(
+                f"Cannot access the scan-history database at {self.path}. "
+                f"{type(exc).__name__}: {exc}. "
+                "Check that the folder is writable and the file is not a directory. "
+                "Existing progress and request history have not been deleted."
+            ) from exc
 
     def __enter__(self) -> HistoryStore:
         return self

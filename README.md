@@ -1,6 +1,6 @@
 # Gmail Unsubscriber
 
-**Version 3.1.1 | Windows and Linux | Python 3.10+**
+**Version 3.1.2 | Windows and Linux | Python 3.10+**
 
 Scan Gmail mailing lists, choose which senders to unsubscribe from, and review the results. Auto unsubscribe is available as an option. The desktop interface stays lightweight and uses the original Tkinter layout.
 
@@ -95,12 +95,15 @@ Use **Export results** for a CSV snapshot or enable automatic export. Results ca
 
 ### Local scan history
 
-Version 3.1.0 uses a local SQLite database, separate from the application source:
+Version 3.1.2 uses a local SQLite database, separate from the application source:
 
 | System | Location |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\gmail-unsubscriber\progress.sqlite3` |
+| Windows, new database | `%USERPROFILE%\.gmail-unsubscriber\progress.sqlite3` |
+| Windows, existing legacy database | `%LOCALAPPDATA%\gmail-unsubscriber\progress.sqlite3` |
 | Linux | `${XDG_STATE_HOME:-~/.local/state}/gmail-unsubscriber/progress.sqlite3` |
+
+On Windows, new scan-history databases are stored under the user-profile directory to avoid AppData write redirection. If the earlier AppData database already exists, the application **continues using that exact database** to preserve saved progress and prevent resending requests. It does not silently start a different database when an existing database cannot be opened. If a database error occurs, use `python diagnose_history.py` from the application folder to check both Windows paths. This command checks directory write access without reading Gmail or changing your saved scan history.
 
 It saves mailbox UIDs, header metadata, scan configuration, request results, and a per-account delivery ledger. It does not store your Gmail app password or email bodies. The database is **not encrypted** and may contain private unsubscribe URLs or tokens. Keep it private and never upload it to your repository.
 
