@@ -53,7 +53,7 @@ MAX_URI = 8192
 MAX_BODY = 64 * 1024
 POST_VALUE = "List-Unsubscribe=One-Click"
 POST_BODY = POST_VALUE.encode("ascii")
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 HEADER_FIELDS = "FROM SUBJECT DATE LIST-ID PRECEDENCE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DKIM-SIGNATURE"
 # Use a plain header fetch. The IMAP reader enforces the size limit.
 FETCH_HEADERS = f"(BODY.PEEK[HEADER.FIELDS ({HEADER_FIELDS})])"
@@ -876,7 +876,11 @@ def fetch_for_verification(mail: Any, candidate: Candidate, guard: NetworkGuard)
 
 
 def verify_one_click_dkim(raw: bytes, guard: NetworkGuard) -> tuple[bool, str]:
-    """Verify the message signature, not its Authentication-Results header."""
+    """Require an authenticated DKIM signature covering both one-click headers.
+
+    Report why verification was unavailable without revealing signed message
+    content, authentication tokens, public keys, or unsubscribe URLs.
+    """
     try:
         import dkim
         import dns.exception
@@ -891,20 +895,34 @@ def verify_one_click_dkim(raw: bytes, guard: NetworkGuard) -> tuple[bool, str]:
     if not signatures or len(signatures) > 10:
         return False, "Missing DKIM signature or excessive signatures."
 
+    dns_problem: str | None = None
+
     def dnsfunc(name: bytes, timeout: float = DNS_TIMEOUT) -> bytes | None:
+        nonlocal dns_problem
         guard.check()
         resolver = dns.resolver.Resolver()
         resolver.timeout = min(2.0, DNS_TIMEOUT)
         try:
             answer = resolver.resolve(name.decode("ascii").rstrip(".") + ".", "TXT",
                                       search=False, lifetime=min(float(timeout), DNS_TIMEOUT))
-            values = [b"".join(record.strings) for record in answer]
+            records = [b"".join(record.strings) for record in answer]
             guard.check()
-            return values[0] if len(values) == 1 else None
-        except dns.exception.DNSException:
-            return None
+            if len(records) != 1:
+                dns_problem = "DKIM DNS returned an ambiguous signing-key response."
+                return None
+            return records[0]
+        except dns.resolver.NXDOMAIN:
+            dns_problem = "DKIM signing key is no longer published (DNS NXDOMAIN)."
+        except dns.resolver.NoAnswer:
+            dns_problem = "DKIM signing key has no DNS TXT record."
+        except dns.exception.Timeout:
+            dns_problem = "DKIM signing-key DNS lookup timed out."
+        except dns.exception.DNSException as exc:
+            dns_problem = f"DKIM signing-key DNS lookup error ({type(exc).__name__})."
+        return None
 
-    last_reason = "No valid DKIM signature covering both unsubscribe headers."
+    eligible = False
+    reasons: list[str] = []
     with guard.operation():
         for index, signature in enumerate(signatures):
             guard.check()
@@ -923,18 +941,21 @@ def verify_one_click_dkim(raw: bytes, guard: NetworkGuard) -> tuple[bool, str]:
             if (not valid_tags or not {"from", "list-unsubscribe", "list-unsubscribe-post"} <= covered
                     or tags.get("a", "").lower() not in {"rsa-sha256", "ed25519-sha256"}):
                 continue
+            eligible = True
+            dns_problem = None
             try:
                 verifier = dkim.DKIM(raw, minkey=1024, timeout=DNS_TIMEOUT)
                 if verifier.verify(idx=index, dnsfunc=dnsfunc):
                     guard.check()
                     return True, f"DKIM verified; signing domain: {display_text(tags.get('d', 'unknown'))}."
+                reasons.append(dns_problem or "DKIM cryptographic signature verification failed.")
             except (Cancelled, TimeoutError):
                 raise
-            except Exception:
-                last_reason = "DKIM verification failed or the signing key is unavailable."
-    return False, last_reason
-
-
+            except Exception as exc:
+                reasons.append(dns_problem or f"DKIM verification library error ({type(exc).__name__}).")
+    if not eligible:
+        return False, "No DKIM signature covers both unsubscribe headers with a supported algorithm."
+    return False, reasons[0] if reasons else "DKIM verification failed for an unspecified reason."
 @dataclass(frozen=True)
 class Result:
     candidate: Candidate

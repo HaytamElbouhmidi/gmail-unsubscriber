@@ -1,6 +1,6 @@
 # Gmail Unsubscriber
 
-**Version 3.1.0 | Windows and Linux | Python 3.10+**
+**Version 3.1.1 | Windows and Linux | Python 3.10+**
 
 Scan Gmail mailing lists, choose which senders to unsubscribe from, and review the results. Auto unsubscribe is available as an option. The desktop interface stays lightweight and uses the original Tkinter layout.
 
@@ -105,6 +105,12 @@ Version 3.1.0 uses a local SQLite database, separate from the application source
 It saves mailbox UIDs, header metadata, scan configuration, request results, and a per-account delivery ledger. It does not store your Gmail app password or email bodies. The database is **not encrypted** and may contain private unsubscribe URLs or tokens. Keep it private and never upload it to your repository.
 
 Resuming prevents repeated scanning of checkpointed messages. Requests are reserved in the ledger before delivery to limit duplicate submissions even if the program exits suddenly. A request without a definitive response stays uncertain. Removing the database also removes this protection and should only be done intentionally with the application closed.
+
+### Why an automatic one-click request may require manual action
+
+A valid one-click POST requires a DKIM signature covering both `List-Unsubscribe` and `List-Unsubscribe-Post` (RFC 8058). A failed or unavailable DKIM check blocks the POST. Version 3.1.1 reports the cause more specifically, such as a missing DNS signing key, a DNS timeout, a cryptographic signature mismatch, or a verification-library exception. It does not bypass DKIM, automatically retry a potentially sent request, or assume that a sender removed an address.
+
+A message can show `dkim=pass` in Gmail's original-message view while failing one-click validation if its passing signature does not cover both unsubscribe headers. Older messages may also refer to signing keys no longer published in DNS. For known senders, check Gmail's built-in unsubscribe option or use the unsubscribe control in the original email. Do not paste personalized unsubscribe tokens into public bug reports.
 
 ## Problems?
 
